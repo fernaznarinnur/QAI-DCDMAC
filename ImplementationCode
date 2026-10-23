@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+QAI-DCDMAC: Cyberism-enabled Quantum-AI Adaptive Directional MAC for IoT networks
+=================================================================================
+Frame-based Python simulator that implements the methodology of the paper:
+
+  * hierarchical tree network (sink -> parents -> children), M-beam directional antennas
+  * state construction S_t (Eq. 1, 5), normalisation (Eq. 6)
+  * quantum-enhanced feature map: amplitude encoding (Eq. 7), parameterised circuit U(theta)
+    (Eq. 8), expectation values of observables (Eq. 9), concatenation S'_t (Eq. 10).
+    The circuit is simulated exactly with a 3-qubit real state-vector simulator (NumPy only)
+  * Deep Q-Network agent (pure NumPy, replay buffer, target net, Adam) (Eq. 11-12)
+  * reward function (Eq. 13-18)
+  * adaptive slot scheduling score Omega_i (Eq. 19-20)
+  * directional transmission with argmax beam selection (Eq. 21-22)
+  * per-node duty-cycle adaptation (Eq. 23-25)
+  * Cyberism closed loop: Observe -> Learn -> Schedule -> Transmit -> Update (Eq. 2, Alg. 1)
+  * baselines: S-MAC, DCD-MAC, RL-MAC (tabular Q-learning duty cycle), and an ablation
+    "DQN-DCD" (same as QAI-DCDMAC but without the quantum features)
+  * metrics (Eq. 37-42): throughput, delay, PDR, reliability, energy, lifetime, overhead
+  * experiments: node-density sweep (Fig. 5) and traffic-load sweep (Fig. 6)
+
+Usage
+-----
+    pip install numpy matplotlib
+    python qai_dcdmac_sim.py demo                  # one quick run of every protocol
+    python qai_dcdmac_sim.py density --seeds 3     # Fig. 5 style experiment
+    python qai_dcdmac_sim.py load --seeds 3        # Fig. 6 style experiment
+    python qai_dcdmac_sim.py all --seeds 3 --jobs 4
+    python qai_dcdmac_sim.py all --quick           # small/fast sanity run
+    add --ablation to include the DQN-without-quantum baseline
+
+NOTE: all numbers come from this simulator's own radio / energy model. They show the
+trends of the proposed design but will not reproduce the paper's exact figures.
+"""
+import argparse
+import csv
+import math
+import os
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, asdict
+
+import numpy as np
+
+
+# ----------------------------------------------------------------------------------------
+# Configuration (Table 2 + radio/energy model)
+# ----------------------------------------------------------------------------------------
+@dataclass
+class Cfg:
+    area: float = 100.0            # 100 x 100 m^2
+    n_nodes: int = 100             # 50 ~ 150 (parents + children)
+    children_per_parent: int = 8
+    M: int = 6                     # number of beams / sectors (4 ~ 8)
+    e_init: float = 2.0            # J
+    pkt_bytes: int = 512
+    ctrl_bytes: int = 24
+    frames: int = 1000             # simulation time (frames)
+    train_frames: int = 300        # warm-up/training frames for learning agents
+    lr: float = 0.001              # alpha
+    gamma: float = 0.9             # discount factor
+    # frame structure (Eq. 3)
+    Tf: float = 1.0                # s
+    Ns: int = 10                   # max data slots per frame
+    slot_t: float = 0.05           # s
+    t_ctrl: float = 0.2            # sync + decision + schedule time (s)
+    # traffic
+    load_pps: float = 80.0         # network-wide offered load (packets / s)
+    bursts: bool = True            # Table 3 burst events
+    burst_mult: float = 3.0
+    qmax: int = 30
+    deadline: float = 3.0          # s, for reliability metric
+    max_retry: int = 3
+    # radio
+    pl_exp: float = 3.0
+    shadow_db: float = 4.0
+    pt_child: float = 1.0
+    pt_parent: float = 8.0
+    g_main_db: float = 7.8
+    g_side_db: float = -10.0
+    snr20_db: float = 15.0         # omni SNR at 20 m
+    snr_thr_db: float = 4.0
+    snr_slope_db: float = 1.5
+    sigma_qai: float = 3.0         # beam-measurement noise (dB), per-frame refinement
+    sigma_dcd: float = 7.0         # beam-measurement noise (dB), one-shot neighbour discovery
+    # energy (Joule)
+    e_tx: float = 0.30e-3
+    e_rx: float = 0.25e-3
+    e_fwd: float = 0.30e-3
+    e_idle: float = 0.05e-3
+    e_sync: float = 0.06e-3
+    e_ctrl: float = 0.02e-3
+    e_sleep: float = 0.002e-3
+    # duty cycle adaptation (Eq. 24-25)
+    delta: float = 0.1
+
+
+PROTOCOLS = ("smac", "dcd", "rlmac", "qai", "dqn")
+LABELS = {"smac": "S-MAC", "dcd": "DCD-MAC", "rlmac": "RL-MAC", "qai": "QAI-DCDMAC",
+          "dqn": "DQN-DCD (no quantum)"}
+PROFILES = np.array([[0.25, 0.25, 0.20, 0.10, 0.20],    # balanced   (beta1..beta5, Eq. 19)
+                     [0.40, 0.30, 0.10, 0.10, 0.10],    # delay-first
+                     [0.15, 0.15, 0.25, 0.05, 0.40]])   # energy-first
+REWARD_W = (0.20, 0.30, 0.20, 0.15, 0.15)               # w1..w5, sum = 1 (Eq. 18)
+RL_LEVELS = [3, 5, 7, 10]                               # RL-MAC duty levels (slots)
+BURSTS = {0: [(10, 30), (200, 250), (600, 700)],        # Table 3, events A/B/C
+          1: [(40, 50), (250, 300), (650, 750)],
+          2: [(60, 80), (300, 400), (700, 850)]}
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def db2lin(x):
+    return 10.0 ** (np.asarray(x) / 10.0)
+
+
+def sector(angle, M):
+    return (np.floor(((angle % (2 * np.pi)) / (2 * np.pi)) * M).astype(int)) % M
+
+
+# ----------------------------------------------------------------------------------------
+# Quantum-enhanced state representation (Eq. 6-10), exact 3-qubit simulation
+# ----------------------------------------------------------------------------------------
+class QuantumMap:
+    def __init__(self, n_qubits=3, layers=2, seed=7):
+        self.n, self.dim = n_qubits, 2 ** n_qubits
+        rng = np.random.default_rng(seed)
+        theta = rng.uniform(0, 2 * np.pi, (layers, n_qubits))
+        U = np.eye(self.dim)
+        for l in range(layers):
+            R = np.array([[1.0]])
+            for q in range(n_qubits):                      # RY(theta) on every qubit
+                c, s = math.cos(theta[l, q] / 2), math.sin(theta[l, q] / 2)
+                R = np.kron(R, np.array([[c, -s], [s, c]]))
+            U = R @ U
+            for q in range(n_qubits):                      # CNOT ring entangler
+                U = self._cnot(q, (q + 1) % n_qubits) @ U
+        self.U = U                                         # U(theta), real orthogonal
+        obs = []
+        bits = lambda b, q: (b >> (n_qubits - 1 - q)) & 1
+        z = [np.array([1 - 2 * bits(b, q) for b in range(self.dim)], float) for q in range(n_qubits)]
+        for q in range(n_qubits):
+            obs.append(np.diag(z[q]))                      # <Z_q>
+        for i in range(n_qubits):
+            for j in range(i + 1, n_qubits):
+                obs.append(np.diag(z[i] * z[j]))           # <Z_i Z_j>
+        self.obs = np.stack([U.T @ O @ U for O in obs])    # Heisenberg picture: U^T O U
+        self.n_out = len(obs)
+
+    def _cnot(self, c, t):
+        P = np.zeros((self.dim, self.dim))
+        for b in range(self.dim):
+            bc = (b >> (self.n - 1 - c)) & 1
+            b2 = b ^ (1 << (self.n - 1 - t)) if bc else b
+            P[b2, b] = 1
+        return P
+
+    def features(self, s):
+        """s: classical state in [0,1]^8 (Eq. 6 already applied) -> f_q(S_t) (Eq. 9)."""
+        x = np.asarray(s, float) + 1e-3
+        psi = x / np.linalg.norm(x)                        # |psi(S_t)> = sum x_k |k>   (Eq. 7)
+        return np.einsum("i,kij,j->k", psi, self.obs, psi)  # <phi|O|phi>, |phi>=U|psi> (Eq. 8-9)
+
+
+# ----------------------------------------------------------------------------------------
+# Learning agents
+# ----------------------------------------------------------------------------------------
+class DQN:
+    """Small MLP Deep Q-Network in NumPy with replay buffer, target network and Adam."""
+
+    def __init__(self, in_dim, n_act, rng, lr=1e-3, gamma=0.9, hid=64, cap=6000, batch=32, tgt=100):
+        self.rng, self.n_act, self.lr, self.g = rng, n_act, lr, gamma
+        self.batch, self.tgt, self.cap = batch, tgt, cap
+        sizes = [in_dim, hid, hid, n_act]
+        self.p = []
+        for a, b in zip(sizes[:-1], sizes[1:]):
+            self.p += [rng.normal(0, math.sqrt(2.0 / a), (a, b)), np.zeros(b)]
+        self.tp = [x.copy() for x in self.p]
+        self.m = [np.zeros_like(x) for x in self.p]
+        self.v = [np.zeros_like(x) for x in self.p]
+        self.t = 0
+        self.S = np.zeros((cap, in_dim)); self.S2 = np.zeros((cap, in_dim))
+        self.A = np.zeros(cap, int); self.R = np.zeros(cap)
+        self.n = 0; self.ptr = 0
+
+    def q(self, X, p=None):
+        p = p or self.p
+        h1 = np.maximum(0, X @ p[0] + p[1])
+        h2 = np.maximum(0, h1 @ p[2] + p[3])
+        return h2 @ p[4] + p[5]
+
+    def act(self, x, eps):
+        if self.rng.random() < eps:
+            return int(self.rng.integers(self.n_act))
+        return int(np.argmax(self.q(x[None])[0]))
+
+    def store(self, s, a, r, s2):
+        i = self.ptr
+        self.S[i], self.A[i], self.R[i], self.S2[i] = s, a, r, s2
+        self.ptr = (self.ptr + 1) % self.cap
+        self.n = min(self.n + 1, self.cap)
+
+    def train(self):
+        if self.n < 2 * self.batch:
+            return
+        idx = self.rng.integers(0, self.n, self.batch)
+        X, a, r, X2 = self.S[idx], self.A[idx], self.R[idx], self.S2[idx]
+        y = r + self.g * self.q(X2, self.tp).max(1)                      # Bellman target (Eq. 12)
+        W1, b1, W2, b2, W3, b3 = self.p
+        h1p = X @ W1 + b1; h1 = np.maximum(0, h1p)
+        h2p = h1 @ W2 + b2; h2 = np.maximum(0, h2p)
+        out = h2 @ W3 + b3
+        ar = np.arange(self.batch)
+        dout = np.zeros_like(out)
+        dout[ar, a] = np.clip(out[ar, a] - y, -1, 1) / self.batch         # Huber gradient
+        gW3, gb3 = h2.T @ dout, dout.sum(0)
+        dh2 = (dout @ W3.T) * (h2p > 0)
+        gW2, gb2 = h1.T @ dh2, dh2.sum(0)
+        dh1 = (dh2 @ W2.T) * (h1p > 0)
+        gW1, gb1 = X.T @ dh1, dh1.sum(0)
+        self.t += 1
+        for k, g in enumerate([gW1, gb1, gW2, gb2, gW3, gb3]):           # Adam
+            self.m[k] = 0.9 * self.m[k] + 0.1 * g
+            self.v[k] = 0.999 * self.v[k] + 0.001 * g * g
+            mh = self.m[k] / (1 - 0.9 ** self.t); vh = self.v[k] / (1 - 0.999 ** self.t)
+            self.p[k] -= self.lr * mh / (np.sqrt(vh) + 1e-8)
+        if self.t % self.tgt == 0:
+            self.tp = [x.copy() for x in self.p]
+
+
+class TabQ:
+    """Tabular Q-learning used by the RL-MAC baseline."""
+
+    def __init__(self, n_s, n_a, rng, alpha=0.1, gamma=0.9):
+        self.Q = np.zeros((n_s, n_a)); self.rng, self.al, self.g, self.n_a = rng, alpha, gamma, n_a
+
+    def act(self, s, eps):
+        if self.rng.random() < eps:
+            return int(self.rng.integers(self.n_a))
+        return int(np.argmax(self.Q[s]))
+
+    def store(self, s, a, r, s2):
+        self.Q[s, a] += self.al * (r + self.g * self.Q[s2].max() - self.Q[s, a])
+
+    def train(self):
+        pass
+
+
+# ----------------------------------------------------------------------------------------
+# Network topology and channel geometry (Section 3.1)
+# ----------------------------------------------------------------------------------------
+class Network:
+    def __init__(self, cfg, rng):
+        A = cfg.area
+        N = cfg.n_nodes
+        P = max(2, int(round(N / (cfg.children_per_parent + 1))))
+        nc = N - P
+        pos = rng.uniform(0, A, (nc, 2))
+        cent = pos[rng.choice(nc, P, replace=False)].copy()
+        for _ in range(20):                                   # balanced-ish clustering (k-means)
+            par = np.linalg.norm(pos[:, None] - cent[None], axis=2).argmin(1)
+            for p in range(P):
+                m = par == p
+                if m.any():
+                    cent[p] = pos[m].mean(0)
+        par = np.linalg.norm(pos[:, None] - cent[None], axis=2).argmin(1)
+        used = np.unique(par)                                 # drop empty clusters
+        remap = {o: i for i, o in enumerate(used)}
+        par = np.array([remap[x] for x in par]); cent = cent[used]
+        self.P, self.nc = len(used), nc
+        self.pos, self.cent, self.par = pos, cent, par
+        self.kids = [np.flatnonzero(par == p) for p in range(self.P)]
+        self.sink = np.array([A / 2, A / 2])
+        self.dcp = np.maximum(np.linalg.norm(pos - cent[par], axis=1), 1.0)
+        self.dps = np.maximum(np.linalg.norm(cent - self.sink, axis=1), 1.0)
+        th_c = np.arctan2(*(cent[par] - pos).T[::-1])         # child -> parent angle
+        self.true_tx = sector(th_c, cfg.M)
+        self.true_rx = sector(th_c + np.pi, cfg.M)
+
+
+# ----------------------------------------------------------------------------------------
+# The simulator
+# ----------------------------------------------------------------------------------------
+class Sim:
+    def __init__(self, proto, cfg, seed):
+        self.proto, self.cfg, self.seed = proto, cfg, seed
+        topo = np.random.default_rng(seed)
+        self.net = Network(cfg, topo)
+        nc = self.net.nc
+        w = topo.lognormal(0, 0.5, nc)
+        self.lam = cfg.load_pps * cfg.Tf * w / w.sum()        # per-child mean packets / frame
+        self.grp = self.net.par % 3
+        self.N0 = 20.0 ** (-cfg.pl_exp) / db2lin(cfg.snr20_db)
+        self.Gm, self.Gs = db2lin(cfg.g_main_db), db2lin(cfg.g_side_db)
+        self.directional = proto in ("dcd", "qai", "dqn")
+        self.adaptive = proto in ("qai", "dqn")
+        self.learning = proto in ("rlmac", "qai", "dqn")
+        self.rng_ag = np.random.default_rng(seed + 3)
+        self.d_state = 8
+        if proto == "qai":
+            self.qmap = QuantumMap()
+            in_dim = self.d_state + self.qmap.n_out
+        else:
+            in_dim = self.d_state
+        if proto in ("qai", "dqn"):
+            self.agent = DQN(in_dim, 18, self.rng_ag, cfg.lr, cfg.gamma)
+        elif proto == "rlmac":
+            self.agent = TabQ(12, len(RL_LEVELS), self.rng_ag)
+        else:
+            self.agent = None
+        self.eps = 0.05
+        self.steps = 0
+        self.reset_state(seed)
+
+    # ---------------------------------------------------------------- state handling
+    def reset_state(self, seed):
+        cfg, net = self.cfg, self.net
+        self.rng_tr = np.random.default_rng(seed + 1)
+        self.rng_ch = np.random.default_rng(seed + 2)
+        self.Ec = np.full(net.nc, cfg.e_init); self.Ep = np.full(net.P, cfg.e_init)
+        self.alive_c = np.ones(net.nc, bool); self.alive_p = np.ones(net.P, bool)
+        self.q = [[] for _ in range(net.nc)]
+        self.tsleep = np.full(net.nc, 0.2)                    # T_sleep fraction (Eq. 24)
+        self.lam_ema = self.lam.copy()
+        self.Na = np.full(net.P, 6)
+        self.prev = [None] * net.P
+        self.first_death = None
+        self.st = dict(gen=0, deliv=0, drop=0, ontime=0, delay=0.0, data=0, ctrl=0, frames=0)
+        self.e_start = self.Ec.sum() + self.Ep.sum()
+        if self.proto == "dcd":
+            self.update_beams(cfg.sigma_dcd)
+        elif self.proto in ("qai", "dqn"):
+            self.update_beams(cfg.sigma_qai)
+
+    def update_beams(self, sigma):
+        """Beam selection b* = argmax_b G(b) (Eq. 22) from noisy gain measurements."""
+        cfg, net = self.cfg, self.net
+        meas = np.full((net.nc, cfg.M), cfg.g_side_db)
+        meas[np.arange(net.nc), net.true_tx] = cfg.g_main_db
+        meas += self.rng_ch.normal(0, sigma, meas.shape)
+        self.tx_sec = meas.argmax(1)
+        self.aligned = self.tx_sec == net.true_tx
+        self.rx_sec = np.where(self.aligned, net.true_rx, (net.true_rx + 1) % cfg.M)
+
+    def burst(self, f):
+        m = np.ones(self.net.nc)
+        if self.cfg.bursts:
+            for g, ivs in BURSTS.items():
+                if any(a <= f <= b for a, b in ivs):
+                    m[self.grp == g] = self.cfg.burst_mult
+        return m
+
+    # ---------------------------------------------------------------- radio
+    def link_prob(self, a, c, sh):
+        """Success probability of child c[k] -> parent a[k] with co-channel interference."""
+        cfg, net = self.cfg, self.net
+        n = cfg.pl_exp
+        if self.directional:
+            g = np.where(self.aligned[c], self.Gm, self.Gs) ** 2
+        else:
+            g = 1.0
+        sig = cfg.pt_child * net.dcp[c] ** (-n) * sh[c] * g
+        pc, pp = net.pos[c], net.cent[a]
+        diff = pp[None, :, :] - pc[:, None, :]                       # [interferer r, victim q]
+        dist = np.maximum(np.linalg.norm(diff, axis=2), 1.0)
+        if self.directional:
+            ang = np.arctan2(diff[..., 1], diff[..., 0])
+            gt = np.where(sector(ang, cfg.M) == self.tx_sec[c][:, None], self.Gm, self.Gs)
+            gr = np.where(sector(ang + np.pi, cfg.M) == self.rx_sec[c][None, :], self.Gm, self.Gs)
+        else:
+            gt = gr = 1.0
+        inter = cfg.pt_child * dist ** (-n) * gt * gr
+        np.fill_diagonal(inter, 0.0)
+        sinr_db = 10 * np.log10(sig / (self.N0 + inter.sum(0)))
+        return sigmoid((sinr_db - cfg.snr_thr_db) / cfg.snr_slope_db)
+
+    # ---------------------------------------------------------------- queue helpers
+    def pick(self, c, prio_first):
+        q = self.q[c]
+        if prio_first and len(q) > 1:
+            return max(range(len(q)), key=lambda j: (q[j][1], -q[j][0]))
+        return 0
+
+    def drop_pkt(self, c, j, cl):
+        self.q[c].pop(j)
+        self.st["drop"] += 1
+        cl["drop"] += 1
+
+    def fail(self, c, j, cl):
+        pkt = self.q[c][j]
+        pkt[2] += 1
+        if pkt[2] > self.cfg.max_retry:
+            self.drop_pkt(c, j, cl)
+
+    # ---------------------------------------------------------------- one frame (Alg. 1)
+    def frame(self, f, training):
+        cfg, net = self.cfg, self.net
+        P, nc, M = net.P, net.nc, cfg.M
+        rngc = self.rng_ch
+        st = self.st
+
+        # ---- traffic arrivals (Poisson + burst events)
+        arr = self.rng_tr.poisson(self.lam * self.burst(f))
+        for i in np.flatnonzero(arr):
+            for _ in range(arr[i]):
+                u = self.rng_tr.random(); t0 = f - self.rng_tr.random()
+                pr = 3 if u < 0.1 else (2 if u < 0.7 else 1)
+                if not self.alive_c[i]:
+                    continue
+                st["gen"] += 1
+                if len(self.q[i]) < cfg.qmax:
+                    self.q[i].append([t0, pr, 0])
+                else:
+                    st["drop"] += 1
+        self.lam_ema = 0.9 * self.lam_ema + 0.1 * arr
+
+        # ---- channel
+        sh = db2lin(rngc.normal(0, cfg.shadow_db, nc))
+        shp = db2lin(rngc.normal(0, cfg.shadow_db, P))
+        if self.proto in ("qai", "dqn"):
+            self.update_beams(cfg.sigma_qai)
+        elif self.proto == "dcd" and f % 100 == 0 and f > 0:
+            self.update_beams(cfg.sigma_dcd)
+        g = np.where(self.aligned, self.Gm, self.Gs) ** 2 if self.directional else np.ones(nc)
+        snr_db = 10 * np.log10(cfg.pt_child * net.dcp ** (-cfg.pl_exp) * sh * g / self.N0)
+        gp = self.Gm ** 2 if self.directional else 1.0
+        snr_p = 10 * np.log10(cfg.pt_parent * net.dps ** (-cfg.pl_exp) * shp * gp / self.N0)
+        ps = sigmoid((snr_p - cfg.snr_thr_db) / cfg.snr_slope_db)
+        ps_eff = 1 - (1 - ps) ** 2                                # one forwarding retry
+
+        # ---- which nodes are awake this frame
+        if self.adaptive:
+            awake = self.alive_c & (rngc.random(nc) > self.tsleep)
+        else:
+            awake = self.alive_c.copy()
+        qlen = np.array([len(x) for x in self.q])
+        headp = np.array([max((p[1] for p in x), default=0) for x in self.q])
+
+        plans = [None] * P
+        clus = [dict(deliv=0, drop=0, att=0, dsum=0.0, used=0, q0=0) for _ in range(P)]
+        e_before = np.zeros(P)
+        new_states = {}
+
+        # ============ OBSERVE -> LEARN(decide) -> SCHEDULE ============
+        for p in range(P):
+            if not self.alive_p[p]:
+                continue
+            kids = net.kids[p]
+            alive_k = kids[self.alive_c[kids]]
+            if len(alive_k) == 0:
+                continue
+            e_before[p] = self.Ec[kids].sum() + self.Ep[p]
+            ak = alive_k[awake[alive_k]]
+            Efr = self.Ec[alive_k] / cfg.e_init
+            Qn = np.minimum(qlen[alive_k] / 10.0, 1.0)
+            Pn = headp[alive_k] / 3.0
+            snr_n = np.clip(snr_db, 0, 30) / 30.0
+            lamn = np.minimum(self.lam_ema / 2.0, 1.0)
+            S = np.array([Efr.mean(), Efr.min(), Qn.mean(), Qn.max(), snr_n[alive_k].mean(),
+                          lamn[alive_k].mean(), Pn.mean(), self.Na[p] / cfg.Ns])    # S_t (Eq. 5-6)
+            clus[p]["q0"] = int(qlen[alive_k].sum())
+
+            mode, prio_first, profile, a_id, s_feat = "tdma", 0, 0, None, None
+            if self.proto == "smac":
+                mode, Na = "cont", 5
+            elif self.proto == "dcd":
+                mode, Na = "tdma", 6
+            elif self.proto == "rlmac":
+                mode = "cont"
+                qb = 0 if Qn.mean() < 0.1 else 1 if Qn.mean() < 0.3 else 2 if Qn.mean() < 0.6 else 3
+                eb = 0 if Efr.mean() > 0.66 else 1 if Efr.mean() > 0.33 else 2
+                s_feat = qb * 3 + eb
+                a_id = self.agent.act(s_feat, self.eps)
+                Na = RL_LEVELS[a_id]
+            else:                                                # qai / dqn
+                s_feat = np.concatenate([S, self.qmap.features(S)]) if self.proto == "qai" else S  # S'_t (Eq. 10)
+                a_id = self.agent.act(s_feat, self.eps)          # epsilon-greedy over A_t (Eq. 11)
+                profile, duty, prio_first = a_id // 6, (a_id % 6) // 2 - 1, a_id % 2
+                self.Na[p] = int(np.clip(self.Na[p] + duty, 2, cfg.Ns))
+                Na = int(self.Na[p])
+            # store the previous transition now that s' is known
+            if self.learning and self.prev[p] is not None:
+                ps_, pa, pr = self.prev[p]
+                self.agent.store(ps_, pa, pr, s_feat)
+            self.prev[p] = None
+            new_states[p] = (s_feat, a_id)
+
+            # ---- slot scheduling (Eq. 19-20)
+            sched = []
+            if mode == "tdma":
+                el = ak[qlen[ak] > 0]
+                if len(el):
+                    if self.proto == "dcd":                      # fixed round robin
+                        order = np.roll(el, -(f % len(el)))
+                    else:                                        # Omega_i ranking
+                        b = PROFILES[profile]
+                        om = (b[0] * Pn[np.searchsorted(alive_k, el)] + b[1] * Qn[np.searchsorted(alive_k, el)]
+                              + b[2] * snr_n[el] + b[3] * lamn[el]
+                              - b[4] * (1 - self.Ec[el] / cfg.e_init))
+                        order = el[np.argsort(-om)]
+                    rem = {int(i): int(qlen[i]) for i in order}
+                    while len(sched) < Na and any(v > 0 for v in rem.values()):
+                        for i in order:
+                            if rem[int(i)] > 0 and len(sched) < Na:
+                                sched.append(int(i)); rem[int(i)] -= 1
+            plans[p] = dict(mode=mode, Na=Na, ak=ak, sched=sched, prio=prio_first)
+
+            # ---- control phase energy (sync + status report + schedule)
+            nb = len(ak)
+            self.Ec[ak] -= cfg.e_sync + cfg.e_ctrl
+            self.Ep[p] -= cfg.e_ctrl * (2 + nb)
+            st["ctrl"] += 1 + nb + (1 if mode == "tdma" else 0)
+            if mode == "tdma":
+                self.Ec[ak] -= cfg.e_ctrl
+            self.Ec[alive_k] -= cfg.e_sleep
+            if mode == "cont":
+                self.Ec[ak] -= cfg.e_idle * Na                   # idle listening / overhearing
+
+        # ============ TRANSMIT (directional or contention) ============
+        for si in range(cfg.Ns):
+            tx = np.full(P, -1)
+            for p in range(P):
+                pl = plans[p]
+                if pl is None or si >= pl["Na"]:
+                    continue
+                if pl["mode"] == "tdma":
+                    if si < len(pl["sched"]):
+                        tx[p] = pl["sched"][si]
+                else:
+                    cont = [int(i) for i in pl["ak"] if len(self.q[i]) > 0]
+                    if not cont:
+                        continue
+                    bo = self.rng_ch.integers(0, 8, len(cont))
+                    w = [cont[k] for k in range(len(cont)) if bo[k] == bo.min()]
+                    if len(w) == 1:
+                        tx[p] = w[0]
+                    else:                                        # collision inside the cluster
+                        self.Ep[p] -= cfg.e_rx
+                        clus[p]["used"] += 1
+                        for i in w:
+                            self.Ec[i] -= cfg.e_tx
+                            st["data"] += 1; clus[p]["att"] += 1
+                            self.fail(i, 0, clus[p])
+            act = np.flatnonzero(tx >= 0)
+            if len(act) == 0:
+                continue
+            ch = tx[act]
+            ok = rngc.random(len(act)) < self.link_prob(act, ch, sh)
+            for k, p in enumerate(act):
+                c = int(ch[k]); pl = plans[p]; cl = clus[p]
+                if not self.q[c]:
+                    continue
+                j = self.pick(c, pl["prio"])
+                pkt = self.q[c][j]
+                self.Ec[c] -= cfg.e_tx; self.Ep[p] -= cfg.e_rx
+                st["data"] += 1; cl["att"] += 1; cl["used"] += 1
+                st["ctrl"] += 1                                  # ACK
+                if pl["mode"] == "cont":
+                    st["ctrl"] += 2; self.Ec[c] -= 2 * cfg.e_ctrl  # RTS/CTS
+                if ok[k]:
+                    self.Ep[p] -= cfg.e_fwd * (1 + (1 - ps[p]))
+                    self.q[c].pop(j)
+                    if rngc.random() < ps_eff[p]:                # forwarded to sink
+                        d = (f - pkt[0]) * cfg.Tf + cfg.t_ctrl + (si + 1) * cfg.slot_t + 0.05
+                        st["deliv"] += 1; st["delay"] += d
+                        cl["deliv"] += 1; cl["dsum"] += d
+                        if d <= cfg.deadline:
+                            st["ontime"] += 1
+                    else:
+                        st["drop"] += 1; cl["drop"] += 1
+                else:
+                    self.fail(c, j, cl)
+
+        # ---- parent idle-listening cost, reward, learning transitions
+        qlen2 = np.array([len(x) for x in self.q])
+        for p in range(P):
+            pl = plans[p]
+            if pl is None:
+                continue
+            kids = net.kids[p]; cl = clus[p]
+            self.Ep[p] -= cfg.e_idle * max(0, pl["Na"] - cl["used"])
+            if self.learning:
+                econs = e_before[p] - (self.Ec[kids].sum() + self.Ep[p])
+                emax = len(kids) * (cfg.e_sync + 2 * cfg.e_ctrl) + cfg.Ns * (cfg.e_tx + cfg.e_rx + cfg.e_fwd)
+                RE = 1 - min(1.0, econs / emax)                                         # Eq. 14
+                RTh = cl["deliv"] / max(1, min(cfg.Ns, cl["q0"])) if cl["q0"] else 1.0   # Eq. 15 (demand-normalised)
+                dmean = cl["dsum"] / cl["deliv"] if cl["deliv"] else 0.0
+                RD = 0.5 * min(1.0, dmean / 5.0) + 0.5 * min(1.0, qlen2[kids].mean() / 10.0)  # Eq. 16 (+backlog)
+                RPDR = cl["deliv"] / cl["att"] if cl["att"] else 1.0                    # Eq. 17
+                RL = cl["drop"] / max(1, cl["deliv"] + cl["drop"])
+                w = REWARD_W
+                R = w[0] * RE + w[1] * RTh - w[2] * RD + w[3] * RPDR - w[4] * RL      # Eq. 13
+                s_feat, a_id = new_states[p]
+                self.prev[p] = (s_feat, a_id, R)
+
+        if self.learning and (training or True):
+            for _ in range(2):
+                self.agent.train()
+
+        # ---- Eq. 24-25: per-node adaptive sleep time
+        if self.adaptive:
+            high = (qlen2 >= 5) | (np.array([max((p[1] for p in x), default=0) for x in self.q]) == 3)
+            low = (qlen2 <= 1) & (self.Ec / cfg.e_init < 0.3)
+            self.tsleep = np.clip(self.tsleep + np.where(high, -cfg.delta, np.where(low, cfg.delta, 0.0)), 0.0, 0.8)
+
+        # ---- energy depletion / lifetime
+        if training:
+            self.Ec = np.maximum(self.Ec, 0.05 * cfg.e_init)
+            self.Ep = np.maximum(self.Ep, 0.05 * cfg.e_init)
+        else:
+            dead_c = self.alive_c & (self.Ec <= 0); dead_p = self.alive_p & (self.Ep <= 0)
+            if (dead_c.any() or dead_p.any()) and self.first_death is None:
+                self.first_death = f
+            self.alive_c &= ~dead_c; self.alive_p &= ~dead_p
+        st["frames"] += 1
+
+    # ---------------------------------------------------------------- full run
+    def run(self):
+        cfg = self.cfg
+        if self.learning:                                        # warm-up / training phase
+            n_tr = cfg.train_frames * self.net.P * 0.6
+            for f in range(cfg.train_frames):
+                self.eps = max(0.05, 1.0 - self.steps / n_tr)
+                self.steps += self.net.P
+                self.frame(f, training=True)
+            self.reset_state(self.seed)
+        self.eps = 0.05
+        for f in range(cfg.frames):
+            self.frame(f, training=False)
+            if self.first_death is not None and f - self.first_death >= 0:
+                break                                            # stop at first node death
+        return self.metrics()
+
+    def metrics(self):
+        cfg, st = self.cfg, self.st
+        T = max(1, st["frames"]) * cfg.Tf
+        res = st["deliv"] + st["drop"]
+        e_used = self.e_start - (np.maximum(self.Ec, 0).sum() + np.maximum(self.Ep, 0).sum())
+        return dict(
+            throughput=st["deliv"] / T,                                          # Eq. 37 (pps)
+            delay_ms=1000 * st["delay"] / max(1, st["deliv"]),                   # Eq. 38
+            pdr=100 * st["deliv"] / max(1, res),                                 # Eq. 39
+            reliability=100 * st["ontime"] / max(1, st["gen"]),
+            energy_J=e_used,                                                     # Eq. 40
+            lifetime=self.first_death if self.first_death is not None else cfg.frames,  # Eq. 41
+            overhead=100 * st["ctrl"] * cfg.ctrl_bytes / max(1, st["data"] * cfg.pkt_bytes))  # Eq. 42
+
+
+# ----------------------------------------------------------------------------------------
+# Experiments
+# ----------------------------------------------------------------------------------------
+METRICS = ["throughput", "pdr", "delay_ms", "reliability", "lifetime", "overhead"]
+TITLES = {"throughput": "(a) Throughput (pps)", "pdr": "(b) PDR (%)", "delay_ms": "(c) Delay (ms)",
+          "reliability": "(d) Reliability (%)", "lifetime": "(e) Lifetime (frames)",
+          "overhead": "(f) Overhead (%)"}
+
+
+def run_one(args):
+    proto, cfgd, seed = args
+    m = Sim(proto, Cfg(**cfgd), seed).run()
+    m.update(proto=proto, seed=seed)
+    return m
+
+
+def sweep(name, xs, make_cfg, protos, seeds, jobs, base):
+    tasks = []
+    for x in xs:
+        for p in protos:
+            for s in range(seeds):
+                tasks.append((p, asdict(make_cfg(base, x)), 100 + s))
+    print(f"[{name}] {len(tasks)} runs ...", flush=True)
+    if jobs > 1:
+        with ProcessPoolExecutor(jobs) as ex:
+            out = list(ex.map(run_one, tasks))
+    else:
+        out = [run_one(t) for t in tasks]
+    rows, i = [], 0
+    for x in xs:
+        for p in protos:
+            for s in range(seeds):
+                r = out[i]; i += 1
+                r["x"] = x
+                rows.append(r)
+    return rows
+
+
+def aggregate(rows, xs, protos):
+    agg = {p: {m: ([], []) for m in METRICS} for p in protos}
+    for p in protos:
+        for x in xs:
+            sel = [r for r in rows if r["proto"] == p and r["x"] == x]
+            for m in METRICS:
+                v = np.array([r[m] for r in sel])
+                agg[p][m][0].append(v.mean()); agg[p][m][1].append(v.std())
+    return agg
+
+
+def report(agg, xs, xlabel, protos):
+    print(f"\n{'':14s}" + "".join(f"{m:>13s}" for m in METRICS))
+    for p in protos:
+        print(f"{LABELS[p]:14s}" + "".join(f"{np.mean(agg[p][m][0]):13.2f}" for m in METRICS))
+    if "qai" in protos and "dcd" in protos:
+        q, d = agg["qai"], agg["dcd"]
+        imp = {
+            "throughput": 100 * (np.array(q["throughput"][0]) / np.array(d["throughput"][0]) - 1),
+            "delay_ms": 100 * (1 - np.array(q["delay_ms"][0]) / np.array(d["delay_ms"][0])),
+            "lifetime": 100 * (np.array(q["lifetime"][0]) / np.array(d["lifetime"][0]) - 1),
+            "overhead": 100 * (1 - np.array(q["overhead"][0]) / np.array(d["overhead"][0])),
+        }
+        print(f"\nQAI-DCDMAC vs DCD-MAC (mean over {xlabel}):")
+        for k, v in imp.items():
+            word = "reduction" if k in ("delay_ms", "overhead") else "improvement"
+            print(f"  {k:12s} {word}: {v.mean():6.1f} %   (range {v.min():.1f} .. {v.max():.1f})")
+
+
+def save(rows, agg, xs, xlabel, protos, tag, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, f"results_{tag}.csv"), "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["x", "proto", "seed"] + METRICS + ["energy_J"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r[k] for k in w.fieldnames})
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed - skipping plots"); return
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    styles = {"smac": ("s-", "k"), "dcd": ("o-", "r"), "rlmac": ("^-", "b"),
+              "qai": ("v-", "g"), "dqn": ("d--", "m")}
+    for ax, m in zip(axes.ravel(), METRICS):
+        for p in protos:
+            mk, col = styles[p]
+            mu, sd = np.array(agg[p][m][0]), np.array(agg[p][m][1])
+            ax.plot(xs, mu, mk, color=col, label=LABELS[p])
+            ax.fill_between(xs, mu - sd, mu + sd, color=col, alpha=0.12)
+        ax.set_title(TITLES[m]); ax.set_xlabel(xlabel); ax.grid(alpha=0.3)
+    axes[0, 0].legend()
+    fig.tight_layout()
+    path = os.path.join(outdir, f"fig_{tag}.png")
+    fig.savefig(path, dpi=150)
+    print("saved", path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="QAI-DCDMAC simulator")
+    ap.add_argument("mode", choices=["demo", "density", "load", "all"])
+    ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--quick", action="store_true", help="fewer frames / points (sanity run)")
+    ap.add_argument("--ablation", action="store_true", help="also run DQN without quantum features")
+    ap.add_argument("--out", default="qai_results")
+    a = ap.parse_args()
+
+    base = Cfg()
+    protos = list(PROTOCOLS if a.ablation else ("smac", "dcd", "rlmac", "qai"))
+    if a.quick:
+        base.frames, base.train_frames = 300, 150
+        a.seeds = min(a.seeds, 1)
+
+    if a.mode == "demo":
+        for p in protos:
+            m = Sim(p, base, 100).run()
+            print(f"{LABELS[p]:22s}" + "  ".join(f"{k}={m[k]:.2f}" for k in METRICS))
+        return
+
+    if a.mode in ("density", "all"):
+        xs = [50, 100, 150] if a.quick else [50, 70, 90, 110, 130, 150]
+        mk = lambda b, x: Cfg(**{**asdict(b), "n_nodes": x, "load_pps": 0.8 * x})   # 0.8 pps / node
+        rows = sweep("density", xs, mk, protos, a.seeds, a.jobs, base)
+        agg = aggregate(rows, xs, protos)
+        report(agg, xs, "node density", protos)
+        save(rows, agg, xs, "Number of nodes", protos, "density", a.out)
+
+    if a.mode in ("load", "all"):
+        xs = [20, 100, 200] if a.quick else [20, 50, 80, 110, 140, 170, 200]
+        mk = lambda b, x: Cfg(**{**asdict(b), "n_nodes": 100, "load_pps": float(x)})
+        rows = sweep("load", xs, mk, protos, a.seeds, a.jobs, base)
+        agg = aggregate(rows, xs, protos)
+        report(agg, xs, "traffic load", protos)
+        save(rows, agg, xs, "Offered load (pps)", protos, "load", a.out)
+
+
+if __name__ == "__main__":
+    main()
